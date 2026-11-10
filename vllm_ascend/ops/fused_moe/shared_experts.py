@@ -714,14 +714,13 @@ class AscendSharedExperts:
         # W8A8 and W4A8 share an INT8-activation implementation; A8 names
         # the activation width and does not imply that weights are INT8.
         if has_quantized_shared_without_lora and self.quant_type in (QuantType.W8A8, QuantType.W4A8):
-            # SiTU uses a different operator. DequantSwiGLUQuant requires an
-            # aligned logical output width for the local Gate-Up shard.
-            gate_up_width = getattr(self.layer.gate_up_proj, "output_size_per_partition", 0)
-            if self.situ_activation is not None or (
-                gate_up_width > 0 and gate_up_width % DEQUANT_SWIGLU_QUANT_INPUT_ALIGNMENT == 0
+            if self.situ_activation is None and get_current_hardware_profile().supports(
+                HardwareCapability.DEQUANT_SWIGLU_QUANT_64_ALIGNMENT
             ):
-                return SharedExpertMLPPath.A8_INT_FUSED
-            return SharedExpertMLPPath.LINEAR_WRAPPER
+                gate_up_width = getattr(self.layer.gate_up_proj, "output_size_per_partition", 0)
+                if gate_up_width <= 0 or gate_up_width % DEQUANT_SWIGLU_QUANT_INPUT_ALIGNMENT != 0:
+                    return SharedExpertMLPPath.LINEAR_WRAPPER
+            return SharedExpertMLPPath.A8_INT_FUSED
         # This MXFP path currently represents W4A8MXFP only (MXFP4 weights
         # with MXFP8 activations).
         if has_quantized_shared_without_lora and self.quant_type == QuantType.W4A8MXFP:

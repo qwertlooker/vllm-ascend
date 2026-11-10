@@ -66,6 +66,10 @@ class TestSharedMXFPActivation(unittest.TestCase):
             float8_e4m3fn="fp8",
             ops=SimpleNamespace(_C_ascend=SimpleNamespace(npu_swiglu_group_quant=self.fused)),
         )
+        hardware_capability = SimpleNamespace(DEQUANT_SWIGLU_QUANT_64_ALIGNMENT=object())
+        self.hardware_profile = SimpleNamespace(
+            supports=lambda capability: capability is hardware_capability.DEQUANT_SWIGLU_QUANT_64_ALIGNMENT,
+        )
         self.namespace: dict[str, Any] = {
             "torch": self.torch,
             "QuantType": self.quant,
@@ -79,6 +83,8 @@ class TestSharedMXFPActivation(unittest.TestCase):
             "AscendSiluAndMul": self.activation_cls,
             "F": SimpleNamespace(sigmoid=lambda x: x),
             "logger": Mock(),
+            "HardwareCapability": hardware_capability,
+            "get_current_hardware_profile": lambda: self.hardware_profile,
         }
         self.load_ast(source, [paths, *constants, *methods])
         self.paths = self.namespace["SharedExpertMLPPath"]
@@ -257,6 +263,16 @@ class TestSharedMXFPActivation(unittest.TestCase):
                     self.executor.part1.assert_called_with("input")
                     self.executor.apply_activation.assert_called_with(self.gate_up)
                     self.executor.layer.down_proj.assert_called_with("original_activation")
+
+    def test_int_swiglu_alignment_only_applies_to_the_matching_kernel(self):
+        self.executor.quant_type = self.quant.W8A8
+        self.executor.layer.gate_up_proj.output_size_per_partition = 352
+
+        with patch.object(self.hardware_profile, "supports", return_value=False):
+            self.assertIs(self.executor._select_mlp_path(), self.paths.A8_INT_FUSED)
+
+        self.executor.situ_activation = object()
+        self.assertIs(self.executor._select_mlp_path(), self.paths.A8_INT_FUSED)
 
     def test_generic_wrapper_does_not_try_mxfp_fusion(self):
         for quant in (self.quant.W8A8FP, self.quant.W4A4MXFP, self.quant.NONE):

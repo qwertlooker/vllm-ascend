@@ -76,6 +76,8 @@ class HardwareCapability(Enum):
     COMPATIBILITY_OP_IMPLEMENTATIONS = auto()
     # Install distributed-communication adaptations required by the compatibility path.
     DISTRIBUTED_COMMUNICATION_ADAPTATION = auto()
+    # The fused dequant-SwiGLU-quant operator requires a 64-element input-width multiple.
+    DEQUANT_SWIGLU_QUANT_64_ALIGNMENT = auto()
     # Use DSA C128-state kernel block sizes ``[4, 8, 16]`` instead of ``[8, 16, 32]``.
     DSA_C128_STATE_SMALL_BLOCK_SIZES = auto()
     # Use the DeepSeek-V4/DSA compressed-KV-cache layout and compressor/indexer flow.
@@ -249,6 +251,7 @@ _STANDARD_CAPABILITIES = frozenset(
         HardwareCapability.ATB_EXTENSIONS,
         HardwareCapability.ATB_WARMUP,
         HardwareCapability.BGMV_SGMV_META_REGISTRATION,
+        HardwareCapability.DEQUANT_SWIGLU_QUANT_64_ALIGNMENT,
         HardwareCapability.FLA_GDN_PREFILL,
         HardwareCapability.FUSED_ROTARY_MUL_INTERLEAVE,
         HardwareCapability.FUSED_SWIGLU_TUNING_ARGS,
