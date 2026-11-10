@@ -1179,7 +1179,7 @@ def test_shared_expert_mlp_path_preserves_quant_and_lora_semantics(
     expected_path,
 ):
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
-    gate_up_proj = SimpleNamespace()
+    gate_up_proj = SimpleNamespace(output_size_per_partition=704)
     down_proj = SimpleNamespace()
     if has_scales:
         gate_up_proj.weight_scale = torch.ones(1)
@@ -1189,6 +1189,7 @@ def test_shared_expert_mlp_path_preserves_quant_and_lora_semantics(
         down_proj=down_proj,
     )
     shared_experts.quant_type = quant_type
+    shared_experts.situ_activation = None
     shared_experts.lora_context = object() if has_active_lora else None
     monkeypatch.setattr(shared_experts_module, "has_lora", lambda _: has_active_lora)
 
@@ -1251,13 +1252,20 @@ def test_int_shared_expert_preserves_output_gate(monkeypatch, quant_type, gate_m
     down_output = torch.tensor([[2.0, 4.0], [6.0, 8.0]], dtype=hidden_states.dtype)
     gate_weight = torch.tensor([[1.0, 2.0]], dtype=hidden_states.dtype)
     expert_gate = MagicMock(side_effect=lambda x: (F.linear(x, gate_weight), None))
+    gate_up_width = 4 if use_situ else 64
     shared_experts.layer = SimpleNamespace(
-        gate_up_proj=SimpleNamespace(weight_scale=torch.ones(4), weight_scale_fp32=torch.ones(4)),
-        down_proj=SimpleNamespace(weight=torch.ones(2, 2, dtype=torch.int8), weight_scale=torch.ones(2)),
+        gate_up_proj=SimpleNamespace(
+            output_size_per_partition=gate_up_width,
+            weight_scale=torch.ones(gate_up_width),
+            weight_scale_fp32=torch.ones(gate_up_width),
+        ),
+        down_proj=SimpleNamespace(
+            weight=torch.ones(gate_up_width // 2, 2, dtype=torch.int8), weight_scale=torch.ones(2)
+        ),
     )
     if gate_mode != "absent":
         shared_experts.layer.expert_gate = expert_gate if gate_mode == "present" else None
-    quantized_x = torch.ones(2, 2, dtype=torch.int8)
+    quantized_x = torch.ones(2, gate_up_width // 2, dtype=torch.int8)
     scale = torch.ones(2)
     activation = MagicMock(return_value=(quantized_x, scale))
     down_matmul = MagicMock(return_value=down_output)
@@ -1277,7 +1285,7 @@ def test_int_shared_expert_preserves_output_gate(monkeypatch, quant_type, gate_m
     assert path is SharedExpertMLPPath.A8_INT_FUSED
     submitted = SubmittedSharedExpertGateUp(
         hidden_states=hidden_states,
-        gate_up=torch.ones(2, 4, dtype=torch.int32),
+        gate_up=torch.ones(2, gate_up_width, dtype=torch.int32),
         gate_up_input_scale=torch.ones(2),
         local_dp_metadata=None,
         path=path,
