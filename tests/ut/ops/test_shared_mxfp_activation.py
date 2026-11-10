@@ -39,7 +39,12 @@ class TestSharedMXFPActivation(unittest.TestCase):
             "validate_consistency",
         }
         methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
-        constant_names = {"MXFP8_ACTIVATION_GROUP_SIZE", "SWIGLU_MX_INPUT_ALIGNMENT", "SWIGLU_MX_QUANT_MODE"}
+        constant_names = {
+            "DEQUANT_SWIGLU_QUANT_INPUT_ALIGNMENT",
+            "MXFP8_ACTIVATION_GROUP_SIZE",
+            "SWIGLU_MX_INPUT_ALIGNMENT",
+            "SWIGLU_MX_QUANT_MODE",
+        }
         constants = [
             n
             for n in tree.body
@@ -89,13 +94,14 @@ class TestSharedMXFPActivation(unittest.TestCase):
         down.weight_scale = object()
         self.executor.layer = SimpleNamespace(
             down_proj=down,
-            gate_up_proj=SimpleNamespace(weight_scale=object()),
+            gate_up_proj=SimpleNamespace(output_size_per_partition=704, weight_scale=object()),
             act_fn=self.activation_cls(),
             expert_gate=None,
         )
         self.executor.quant_type = self.quant.W8A8MXFP
         self.executor.lora_context = None
         self.executor.multistream_overlap = True
+        self.executor.situ_activation = None
         self.executor.swiglu_limit = 0.0
         self.gate_up = SimpleNamespace(dtype="bf16", ndim=2, shape=(36, 4096))
         self.executor.part1 = Mock(return_value=self.gate_up)
@@ -231,6 +237,26 @@ class TestSharedMXFPActivation(unittest.TestCase):
                 self.assertEqual(self.run_mlp(), expected)
         self.executor.apply_activation.assert_not_called()
         self.fused.assert_not_called()
+
+    def test_unaligned_int_path_uses_registered_linears(self):
+        for quant in (self.quant.W8A8, self.quant.W4A8):
+            self.executor.quant_type = quant
+            for width in (352, 176):
+                with self.subTest(quant=quant, width=width):
+                    self.executor.layer.gate_up_proj.output_size_per_partition = width
+                    self.gate_up.shape = (36, width)
+                    self.assertIs(self.executor._select_mlp_path(), self.paths.LINEAR_WRAPPER)
+
+                    gate_up_input = self.executor._prepare_gate_up_input("input")
+                    prepared = SimpleNamespace(
+                        hidden_states="input", gate_up_input=gate_up_input, local_dp_metadata=None
+                    )
+                    submitted = self.executor.enqueue_gate_up_after_router(prepared, "router")
+                    self.assertEqual(self.executor._finish_shared_mlp(submitted, self.events), 7)
+
+                    self.executor.part1.assert_called_with("input")
+                    self.executor.apply_activation.assert_called_with(self.gate_up)
+                    self.executor.layer.down_proj.assert_called_with("original_activation")
 
     def test_generic_wrapper_does_not_try_mxfp_fusion(self):
         for quant in (self.quant.W8A8FP, self.quant.W4A4MXFP, self.quant.NONE):

@@ -41,6 +41,7 @@ from vllm_ascend.quantization.prepared_linear_input import PreparedLinearInput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stream
 
+DEQUANT_SWIGLU_QUANT_INPUT_ALIGNMENT = 64
 # CANN uses 36 to select FP8 E4M3FN output for situ_mx_quant.
 SITU_MX_DST_TYPE_E4M3FN = 36
 MXFP8_ACTIVATION_GROUP_SIZE = 32
@@ -713,7 +714,14 @@ class AscendSharedExperts:
         # W8A8 and W4A8 share an INT8-activation implementation; A8 names
         # the activation width and does not imply that weights are INT8.
         if has_quantized_shared_without_lora and self.quant_type in (QuantType.W8A8, QuantType.W4A8):
-            return SharedExpertMLPPath.A8_INT_FUSED
+            # SiTU uses a different operator. DequantSwiGLUQuant requires an
+            # aligned logical output width for the local Gate-Up shard.
+            gate_up_width = getattr(self.layer.gate_up_proj, "output_size_per_partition", 0)
+            if self.situ_activation is not None or (
+                gate_up_width > 0 and gate_up_width % DEQUANT_SWIGLU_QUANT_INPUT_ALIGNMENT == 0
+            ):
+                return SharedExpertMLPPath.A8_INT_FUSED
+            return SharedExpertMLPPath.LINEAR_WRAPPER
         # This MXFP path currently represents W4A8MXFP only (MXFP4 weights
         # with MXFP8 activations).
         if has_quantized_shared_without_lora and self.quant_type == QuantType.W4A8MXFP:
