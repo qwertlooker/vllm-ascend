@@ -29,8 +29,10 @@ class TestSharedMXFPActivation(unittest.TestCase):
         names = {
             "_apply_output_gate",
             "_can_fuse_w8a8_mxfp_activation",
+            "_can_use_a8_int_fused",
             "_prepare_w8a8_mxfp_down_input",
             "_prepare_gate_up_input",
+            "_resolve_gate_up_output_width",
             "enqueue_gate_up_after_router",
             "_finish_linear_wrapped_mlp",
             "_finish_shared_mlp",
@@ -45,6 +47,47 @@ class TestSharedMXFPActivation(unittest.TestCase):
             for n in tree.body
             if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in constant_names for t in n.targets)
         ]
+        device_op_source = self.root / "vllm_ascend/device/device_op.py"
+        device_op_tree = ast.parse(device_op_source.read_text())
+        device_const_names = {
+            "DEQUANT_SWIGLU_QUANT_DSK_ALIGNMENT",
+            "DEQUANT_SWIGLU_QUANT_DSK_MIN_WIDTH",
+            "DEQUANT_SWIGLU_QUANT_EVEN_ALIGNMENT",
+        }
+        device_constants = [
+            n
+            for n in device_op_tree.body
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id in device_const_names for t in n.targets)
+        ]
+        device_ns: dict[str, Any] = {}
+        self.load_ast(device_op_source, device_constants, namespace=device_ns)
+        adaptor_classes: dict[str, type] = {}
+        for cls_name, base_name in (
+            ("BaseDeviceAdaptor", None),
+            ("A5DeviceAdaptor", "BaseDeviceAdaptor"),
+            ("Ascend310PDeviceAdaptor", "BaseDeviceAdaptor"),
+        ):
+            cls_node = next(n for n in device_op_tree.body if isinstance(n, ast.ClassDef) and n.name == cls_name)
+            width_fn = next(
+                (
+                    n
+                    for n in cls_node.body
+                    if isinstance(n, ast.FunctionDef) and n.name == "supports_dequant_swiglu_quant_width"
+                ),
+                None,
+            )
+            cls_dict: dict[str, Any] = {}
+            if width_fn is not None:
+                fn_ns = dict(device_ns)
+                self.load_ast(device_op_source, [width_fn], namespace=fn_ns)
+                cls_dict["supports_dequant_swiglu_quant_width"] = fn_ns["supports_dequant_swiglu_quant_width"]
+            bases = (adaptor_classes[base_name],) if base_name is not None else ()
+            adaptor_classes[cls_name] = type(cls_name, bases, cls_dict)
+        self.base_adaptor = adaptor_classes["BaseDeviceAdaptor"]
+        self.a5_adaptor = adaptor_classes["A5DeviceAdaptor"]
+        self.compat_adaptor = adaptor_classes["Ascend310PDeviceAdaptor"]
+        self.active_adaptor = self.base_adaptor
         self.quant = QuantType
         self.activation_cls = type("AscendSiluAndMul", (), {})
         self.scheme_cls = type("AscendW8A8MXFP8DynamicLinearMethod", (), {})
@@ -74,6 +117,7 @@ class TestSharedMXFPActivation(unittest.TestCase):
             "AscendSiluAndMul": self.activation_cls,
             "F": SimpleNamespace(sigmoid=lambda x: x),
             "logger": Mock(),
+            "get_device_adaptor": lambda: self.active_adaptor,
         }
         self.load_ast(source, [paths, *constants, *methods])
         self.paths = self.namespace["SharedExpertMLPPath"]
@@ -89,13 +133,14 @@ class TestSharedMXFPActivation(unittest.TestCase):
         down.weight_scale = object()
         self.executor.layer = SimpleNamespace(
             down_proj=down,
-            gate_up_proj=SimpleNamespace(weight_scale=object()),
+            gate_up_proj=SimpleNamespace(output_size_per_partition=704, weight_scale=object()),
             act_fn=self.activation_cls(),
             expert_gate=None,
         )
         self.executor.quant_type = self.quant.W8A8MXFP
         self.executor.lora_context = None
         self.executor.multistream_overlap = True
+        self.executor.situ_activation = None
         self.executor.swiglu_limit = 0.0
         self.gate_up = SimpleNamespace(dtype="bf16", ndim=2, shape=(36, 4096))
         self.executor.part1 = Mock(return_value=self.gate_up)
@@ -106,13 +151,13 @@ class TestSharedMXFPActivation(unittest.TestCase):
         self.events = SimpleNamespace(shared_activation_overlap_start="activation", routed_combine_start="combine")
         self.submitted = SimpleNamespace(hidden_states="input", gate_up=self.gate_up)
 
-    def load_ast(self, source, nodes):
+    def load_ast(self, source, nodes, namespace=None):
         module = ast.Module(
             body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
             type_ignores=[],
         )
         ast.fix_missing_locations(module)
-        exec(compile(module, str(source), "exec"), self.namespace)
+        exec(compile(module, str(source), "exec"), self.namespace if namespace is None else namespace)
 
     def run_mlp(self):
         self.submitted.path = self.executor._select_mlp_path()
@@ -231,6 +276,80 @@ class TestSharedMXFPActivation(unittest.TestCase):
                 self.assertEqual(self.run_mlp(), expected)
         self.executor.apply_activation.assert_not_called()
         self.fused.assert_not_called()
+
+    def test_unaligned_int_path_falls_back_to_registered_linears(self):
+        for quant in (self.quant.W8A8, self.quant.W4A8):
+            self.executor.quant_type = quant
+            for width in (352, 176, 64, 0):
+                with self.subTest(quant=quant, width=width):
+                    self.executor.part1.reset_mock()
+                    self.executor.apply_activation.reset_mock()
+                    self.executor.layer.down_proj.reset_mock()
+                    self.executor.layer.gate_up_proj.output_size_per_partition = width
+                    self.gate_up.shape = (36, width)
+                    self.assertIs(self.executor._select_mlp_path(), self.paths.LINEAR_WRAPPER)
+
+                    gate_up_input = self.executor._prepare_gate_up_input("input")
+                    prepared = SimpleNamespace(
+                        hidden_states="input", gate_up_input=gate_up_input, local_dp_metadata=None
+                    )
+                    submitted = self.executor.enqueue_gate_up_after_router(prepared, "router")
+                    self.assertEqual(self.executor._finish_shared_mlp(submitted, self.events), 7)
+
+                    self.executor.part1.assert_called_once_with("input")
+                    self.executor.apply_activation.assert_called_once_with(self.gate_up)
+                    self.executor.layer.down_proj.assert_called_once_with("original_activation")
+
+    def test_aligned_int_widths_keep_fused_path(self):
+        for quant in (self.quant.W8A8, self.quant.W4A8):
+            self.executor.quant_type = quant
+            for width in (128, 192, 704):
+                with self.subTest(quant=quant, width=width):
+                    self.executor.layer.gate_up_proj.output_size_per_partition = width
+                    self.assertIs(self.executor._select_mlp_path(), self.paths.A8_INT_FUSED)
+
+    def test_int_width_resolution_falls_back_to_scale_shape_and_fails_closed(self):
+        self.executor.quant_type = self.quant.W8A8
+        for gate_up_proj, expected in (
+            (SimpleNamespace(weight_scale=SimpleNamespace(shape=(704,))), self.paths.A8_INT_FUSED),
+            (SimpleNamespace(weight_scale=SimpleNamespace(shape=(704, 1))), self.paths.A8_INT_FUSED),
+            (SimpleNamespace(weight_scale=SimpleNamespace(shape=(352,))), self.paths.LINEAR_WRAPPER),
+            (
+                SimpleNamespace(
+                    weight_scale_fp32=SimpleNamespace(shape=(192,)),
+                    weight_scale=object(),
+                ),
+                self.paths.A8_INT_FUSED,
+            ),
+            (SimpleNamespace(weight_scale=object()), self.paths.LINEAR_WRAPPER),
+            (
+                SimpleNamespace(output_size_per_partition=True, weight_scale=SimpleNamespace(shape=(704,))),
+                self.paths.LINEAR_WRAPPER,
+            ),
+        ):
+            with self.subTest(gate_up_proj=gate_up_proj):
+                self.executor.layer.gate_up_proj = gate_up_proj
+                self.assertIs(self.executor._select_mlp_path(), expected)
+
+    def test_int_swiglu_width_contract_respects_adaptor_and_situ(self):
+        self.executor.quant_type = self.quant.W8A8
+        self.executor.layer.gate_up_proj.output_size_per_partition = 352
+
+        self.active_adaptor = self.base_adaptor
+        self.assertIs(self.executor._select_mlp_path(), self.paths.LINEAR_WRAPPER)
+
+        self.active_adaptor = self.compat_adaptor
+        self.assertIs(self.executor._select_mlp_path(), self.paths.LINEAR_WRAPPER)
+
+        self.active_adaptor = self.a5_adaptor
+        self.assertIs(self.executor._select_mlp_path(), self.paths.A8_INT_FUSED)
+        self.executor.layer.gate_up_proj.output_size_per_partition = 351
+        self.assertIs(self.executor._select_mlp_path(), self.paths.LINEAR_WRAPPER)
+
+        self.active_adaptor = self.base_adaptor
+        self.executor.layer.gate_up_proj.output_size_per_partition = 352
+        self.executor.situ_activation = object()
+        self.assertIs(self.executor._select_mlp_path(), self.paths.A8_INT_FUSED)
 
     def test_generic_wrapper_does_not_try_mxfp_fusion(self):
         for quant in (self.quant.W8A8FP, self.quant.W4A4MXFP, self.quant.NONE):

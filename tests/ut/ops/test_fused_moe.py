@@ -1182,7 +1182,7 @@ def test_shared_expert_mlp_path_preserves_quant_and_lora_semantics(
     gate_up_proj = SimpleNamespace()
     down_proj = SimpleNamespace()
     if has_scales:
-        gate_up_proj.weight_scale = torch.ones(1)
+        gate_up_proj.weight_scale = torch.ones(128)
         down_proj.weight_scale = torch.ones(1)
     shared_experts.layer = SimpleNamespace(
         gate_up_proj=gate_up_proj,
@@ -1191,6 +1191,49 @@ def test_shared_expert_mlp_path_preserves_quant_and_lora_semantics(
     shared_experts.quant_type = quant_type
     shared_experts.lora_context = object() if has_active_lora else None
     monkeypatch.setattr(shared_experts_module, "has_lora", lambda _: has_active_lora)
+
+    assert shared_experts._select_mlp_path() is expected_path
+
+
+@pytest.mark.parametrize("quant_type", [QuantType.W8A8, QuantType.W4A8])
+@pytest.mark.parametrize(
+    ("width", "use_situ", "use_a5_adaptor", "expected_path"),
+    [
+        (704, False, False, SharedExpertMLPPath.A8_INT_FUSED),
+        (192, False, False, SharedExpertMLPPath.A8_INT_FUSED),
+        (128, False, False, SharedExpertMLPPath.A8_INT_FUSED),
+        (352, False, False, SharedExpertMLPPath.LINEAR_WRAPPER),
+        (176, False, False, SharedExpertMLPPath.LINEAR_WRAPPER),
+        (64, False, False, SharedExpertMLPPath.LINEAR_WRAPPER),
+        (352, True, False, SharedExpertMLPPath.A8_INT_FUSED),
+        (352, False, True, SharedExpertMLPPath.A8_INT_FUSED),
+        (351, False, True, SharedExpertMLPPath.LINEAR_WRAPPER),
+    ],
+)
+def test_shared_expert_int_path_guards_dequant_swiglu_quant_width(
+    monkeypatch,
+    quant_type,
+    width,
+    use_situ,
+    use_a5_adaptor,
+    expected_path,
+):
+    from vllm_ascend.device.device_op import A5DeviceAdaptor, BaseDeviceAdaptor
+
+    shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts.layer = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(output_size_per_partition=width, weight_scale=torch.ones(width)),
+        down_proj=SimpleNamespace(weight_scale=torch.ones(1)),
+    )
+    shared_experts.quant_type = quant_type
+    shared_experts.lora_context = None
+    shared_experts.situ_activation = SimpleNamespace(beta=4.0, linear_beta=25.0) if use_situ else None
+    monkeypatch.setattr(shared_experts_module, "has_lora", lambda _: False)
+    monkeypatch.setattr(
+        shared_experts_module,
+        "get_device_adaptor",
+        lambda: A5DeviceAdaptor if use_a5_adaptor else BaseDeviceAdaptor,
+    )
 
     assert shared_experts._select_mlp_path() is expected_path
 
@@ -1251,8 +1294,13 @@ def test_int_shared_expert_preserves_output_gate(monkeypatch, quant_type, gate_m
     down_output = torch.tensor([[2.0, 4.0], [6.0, 8.0]], dtype=hidden_states.dtype)
     gate_weight = torch.tensor([[1.0, 2.0]], dtype=hidden_states.dtype)
     expert_gate = MagicMock(side_effect=lambda x: (F.linear(x, gate_weight), None))
+    gate_up_width = 128
     shared_experts.layer = SimpleNamespace(
-        gate_up_proj=SimpleNamespace(weight_scale=torch.ones(4), weight_scale_fp32=torch.ones(4)),
+        gate_up_proj=SimpleNamespace(
+            output_size_per_partition=gate_up_width,
+            weight_scale=torch.ones(gate_up_width),
+            weight_scale_fp32=torch.ones(gate_up_width),
+        ),
         down_proj=SimpleNamespace(weight=torch.ones(2, 2, dtype=torch.int8), weight_scale=torch.ones(2)),
     )
     if gate_mode != "absent":
@@ -1277,7 +1325,7 @@ def test_int_shared_expert_preserves_output_gate(monkeypatch, quant_type, gate_m
     assert path is SharedExpertMLPPath.A8_INT_FUSED
     submitted = SubmittedSharedExpertGateUp(
         hidden_states=hidden_states,
-        gate_up=torch.ones(2, 4, dtype=torch.int32),
+        gate_up=torch.ones(2, gate_up_width, dtype=torch.int32),
         gate_up_input_scale=torch.ones(2),
         local_dp_metadata=None,
         path=path,
@@ -2427,7 +2475,7 @@ def test_sequence_parallel_sedp_forward_skips_token_comms(monkeypatch):
 def test_active_shared_expert_lora_uses_dense_wrappers(monkeypatch):
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
     shared_experts.layer = SimpleNamespace(
-        gate_up_proj=SimpleNamespace(weight_scale=torch.ones(1)),
+        gate_up_proj=SimpleNamespace(weight_scale=torch.ones(128)),
         down_proj=SimpleNamespace(weight_scale=torch.ones(1)),
     )
     shared_experts.multistream_overlap = False

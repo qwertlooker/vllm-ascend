@@ -41,6 +41,13 @@ if TYPE_CHECKING:
 ACL_HOST_REG_MAPPED = 0x2
 ACL_HOST_REG_PINNED = 0x10000000
 INT64_MAX = torch.iinfo(torch.int64).max
+# Fused INT32 dequant-SwiGLU-quant input width (2 * H_local) contracts:
+# Standard DSK tiling requires 64-element alignment (BLOCK_SIZE * SWI_FACTOR)
+# and at least 128 elements (outDimy >= MASK_NUM_T32 = 64) for WholeReduceMax.
+DEQUANT_SWIGLU_QUANT_DSK_ALIGNMENT = 64
+DEQUANT_SWIGLU_QUANT_DSK_MIN_WIDTH = 128
+# Arch35 (A5) tiling only requires an even gate+up width.
+DEQUANT_SWIGLU_QUANT_EVEN_ALIGNMENT = 2
 
 if HAS_TRITON:
     from vllm_ascend.ops.triton.rms_norm import triton_q_rms  # noqa: F811
@@ -444,6 +451,11 @@ class BaseDeviceAdaptor:
             limit=swiglu_limit,
             bias=swiglu_beta,
         )
+
+    @staticmethod
+    def supports_dequant_swiglu_quant_width(width: int) -> bool:
+        """Return whether fused INT32 dequant-SwiGLU-quant accepts ``width``."""
+        return width >= DEQUANT_SWIGLU_QUANT_DSK_MIN_WIDTH and width % DEQUANT_SWIGLU_QUANT_DSK_ALIGNMENT == 0
 
     @staticmethod
     def kv_cache_load(cache_kv_c, cache_k_pe, block_table, context_seq_len_npu, seq_starts, key, value):
@@ -1502,6 +1514,11 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             max=swiglu_limit,
         )
         return gate * torch.sigmoid(swiglu_alpha * gate) * (up + swiglu_beta)
+
+    @staticmethod
+    def supports_dequant_swiglu_quant_width(width: int) -> bool:
+        """Arch35 dequant-SwiGLU-quant tiling accepts any positive even width."""
+        return width > 0 and width % DEQUANT_SWIGLU_QUANT_EVEN_ALIGNMENT == 0
 
     @staticmethod
     def kv_cache_load(cache_kv_c, cache_k_pe, block_table, context_seq_len_npu, seq_offset, key, value):

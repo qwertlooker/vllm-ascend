@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoEMethodB
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.device.device_op import get_device_adaptor
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.lora.fused_moe import has_lora
 from vllm_ascend.ops.activation import AscendSiluAndMul
@@ -696,6 +697,44 @@ class AscendSharedExperts:
             return self._run_a8_mxfp_mlp(submitted_gate_up, milestones)
         return self._finish_linear_wrapped_mlp(submitted_gate_up, milestones)
 
+    def _resolve_gate_up_output_width(self) -> int | None:
+        """Return the local gate+up output width for this partition, if statically known."""
+        gate_up_proj = self.layer.gate_up_proj
+        if hasattr(gate_up_proj, "output_size_per_partition"):
+            width = gate_up_proj.output_size_per_partition
+            if isinstance(width, int) and not isinstance(width, bool) and width > 0:
+                return width
+            return None
+
+        for scale_attr in ("weight_scale_fp32", "weight_scale"):
+            scale = getattr(gate_up_proj, scale_attr, None)
+            shape = getattr(scale, "shape", None)
+            if shape and (len(shape) == 1 or (len(shape) == 2 and shape[1] == 1)):
+                width = int(shape[0])
+                if width > 0:
+                    return width
+        return None
+
+    def _can_use_a8_int_fused(self) -> bool:
+        """Check whether the INT8-activation fused shared-MLP path satisfies its kernel contract."""
+        if (
+            has_lora(self.lora_context)
+            or self.quant_type not in (QuantType.W8A8, QuantType.W4A8)
+            or not hasattr(self.layer.gate_up_proj, "weight_scale")
+            or not hasattr(self.layer.down_proj, "weight_scale")
+        ):
+            return False
+
+        # SiTU uses dequant_situ_quant, which does not share
+        # npu_dequant_swiglu_quant's width alignment contract.
+        if getattr(self, "situ_activation", None) is not None:
+            return True
+
+        gate_up_width = self._resolve_gate_up_output_width()
+        if gate_up_width is None:
+            return False
+        return get_device_adaptor().supports_dequant_swiglu_quant_width(gate_up_width)
+
     def _select_mlp_path(self) -> SharedExpertMLPPath:
         """Select a path without changing the quantization scheme's math.
 
@@ -705,15 +744,15 @@ class AscendSharedExperts:
         W8A8FP, W4A4MXFP and other schemes use the generic wrapper path.
         Active LoRA always uses that generic path to preserve its adapters.
         """
+        # W8A8 and W4A8 share an INT8-activation implementation; A8 names
+        # the activation width and does not imply that weights are INT8.
+        if self._can_use_a8_int_fused():
+            return SharedExpertMLPPath.A8_INT_FUSED
         has_quantized_shared_without_lora = (
             not has_lora(self.lora_context)
             and hasattr(self.layer.gate_up_proj, "weight_scale")
             and hasattr(self.layer.down_proj, "weight_scale")
         )
-        # W8A8 and W4A8 share an INT8-activation implementation; A8 names
-        # the activation width and does not imply that weights are INT8.
-        if has_quantized_shared_without_lora and self.quant_type in (QuantType.W8A8, QuantType.W4A8):
-            return SharedExpertMLPPath.A8_INT_FUSED
         # This MXFP path currently represents W4A8MXFP only (MXFP4 weights
         # with MXFP8 activations).
         if has_quantized_shared_without_lora and self.quant_type == QuantType.W4A8MXFP:

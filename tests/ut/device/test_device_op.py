@@ -334,3 +334,32 @@ def test_clipped_swiglu_kernel_selection_per_adaptor(adaptor, uses_fused_kernel)
     gate = torch.clamp(x[..., :d], max=limit)
     up = torch.clamp(x[..., d:], min=-limit, max=limit)
     torch.testing.assert_close(out, gate * torch.sigmoid(alpha * gate) * (up + beta))
+
+
+@pytest.mark.parametrize(
+    ("adaptor", "width", "expected"),
+    [
+        (BaseDeviceAdaptor, 128, True),
+        (BaseDeviceAdaptor, 192, True),
+        (BaseDeviceAdaptor, 704, True),
+        (BaseDeviceAdaptor, 64, False),
+        (BaseDeviceAdaptor, 176, False),
+        (BaseDeviceAdaptor, 352, False),
+        (BaseDeviceAdaptor, 0, False),
+        (BaseDeviceAdaptor, -128, False),
+        (Ascend310PDeviceAdaptor, 128, True),
+        (Ascend310PDeviceAdaptor, 64, False),
+        (Ascend310PDeviceAdaptor, 352, False),
+        (A5DeviceAdaptor, 2, True),
+        (A5DeviceAdaptor, 64, True),
+        (A5DeviceAdaptor, 176, True),
+        (A5DeviceAdaptor, 352, True),
+        (A5DeviceAdaptor, 704, True),
+        (A5DeviceAdaptor, 1, False),
+        (A5DeviceAdaptor, 351, False),
+        (A5DeviceAdaptor, 0, False),
+        (A5DeviceAdaptor, -2, False),
+    ],
+)
+def test_dequant_swiglu_quant_width_contract_per_adaptor(adaptor, width, expected):
+    assert adaptor.supports_dequant_swiglu_quant_width(width) is expected
